@@ -1,4 +1,6 @@
-import { writeFileSync } from "node:fs";
+import { writeFileSync, existsSync } from "node:fs";
+import path from "node:path";
+import { gunzipSync } from "node:zlib";
 import { loadConfig } from "../config.js";
 import { logger } from "../logger.js";
 import { listRecordings } from "../plaud/list.js";
@@ -8,6 +10,7 @@ import {
   flattenTranscript,
   extractSummaryMarkdown,
   fetchTranscriptFromContentList,
+  extractMarkdownFromSummaryPayload,
 } from "../plaud/transcript.js";
 import { getFileDetail } from "../plaud/detail.js";
 import { PlaudAuthError } from "../plaud/client.js";
@@ -29,8 +32,9 @@ import {
   PLAUD_TRASH_ASSET_PROBE_MANUAL_SYNC_LIMIT,
   clearError,
   resetPlaudTrashAssetProbeTimestamps,
+  findRecentTranscribedRecordings,
 } from "./state.js";
-import { ensureRecordingFolder } from "./layout.js";
+import { ensureRecordingFolder, sanitizeFilename } from "./layout.js";
 import { fireWebhookForRecording } from "../webhook/post.js";
 import { emit } from "./events.js";
 import type { RecordingRow } from "@applaud/shared";
@@ -219,6 +223,22 @@ class Poller {
         }
       }
     }
+
+    // Phase 4 — Content list markdown: download all summary variants (consumer_note,
+    // auto_sum_note, highlights, etc.) for recordings from the last 14 days.
+    // File-existence check inside downloadContentListMarkdown prevents re-downloading.
+    const recentCutoff = Date.now() - 14 * 24 * 60 * 60 * 1000;
+    const recentTranscribed = findRecentTranscribedRecordings(recentCutoff);
+    for (const row of recentTranscribed) {
+      if (!cfg.recordingsDir) continue;
+      try {
+        const detail = await getFileDetail(row.id);
+        const folderAbs = path.join(cfg.recordingsDir, row.folder);
+        await this.downloadContentListMarkdown(detail.content_list ?? [], folderAbs, row.id);
+      } catch (err) {
+        logger.warn({ err, id: row.id }, "Phase 4 content_list download failed (non-fatal)");
+      }
+    }
   }
 
   private async processRecording(row: RecordingRow): Promise<void> {
@@ -267,6 +287,51 @@ class Poller {
         logger.warn({ err, id: row.id }, "transcript/summary fetch failed");
         recordError(row.id, msg);
         emit("error", { recordingId: row.id, message: msg });
+      }
+    }
+  }
+
+  private async downloadContentListMarkdown(
+    contentList: { data_type: string; data_tab_name: string; data_title: string; data_id: string; data_link: string; task_status: number }[],
+    folderAbs: string,
+    recordingId: string,
+    forceOverwrite = false,
+  ): Promise<void> {
+    const NOTE_TYPES = new Set([
+      "auto_sum_note",
+      "outline",
+      "sum_multi_note",
+      "high_light",
+      "mark_memo",
+      "consumer_note",
+      "transaction_polish",
+    ]);
+
+    for (const item of contentList) {
+      if (!item?.data_link) continue;
+      if (!NOTE_TYPES.has(item.data_type)) continue;
+      if (item.task_status !== 1) continue;
+
+      const baseLabel =
+        sanitizeFilename(item.data_tab_name || item.data_title || item.data_type || "note") || "note";
+      const fileName = `${baseLabel}__${item.data_type}__${item.data_id.slice(-8)}.md`;
+      const destPath = path.join(folderAbs, fileName);
+      if (existsSync(destPath) && !forceOverwrite) continue;
+
+      try {
+        const res = await fetch(item.data_link);
+        if (!res.ok) {
+          logger.warn({ id: recordingId, dataType: item.data_type, status: res.status }, "content_list item download failed");
+          continue;
+        }
+        const buf = Buffer.from(await res.arrayBuffer());
+        let raw: string;
+        try { raw = gunzipSync(buf).toString("utf8"); } catch { raw = buf.toString("utf8"); }
+        const extracted = extractMarkdownFromSummaryPayload(raw);
+        writeFileSync(destPath, extracted && extracted.trim().length > 0 ? extracted : raw, "utf8");
+        logger.info({ id: recordingId, dataType: item.data_type, fileName }, "content_list item downloaded");
+      } catch (err) {
+        logger.warn({ err, id: recordingId, dataType: item.data_type }, "content_list item download error");
       }
     }
   }

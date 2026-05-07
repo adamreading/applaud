@@ -395,6 +395,20 @@ export function findRecordingsNeedingAssets(): RecordingRow[] {
   return rows.map(rowToRecording);
 }
 
+export function findRecentTranscribedRecordings(cutoffMs: number): RecordingRow[] {
+  const rows = getDb()
+    .prepare<[number], RecordingDbRow>(
+      `SELECT * FROM recordings
+       WHERE transcript_downloaded_at IS NOT NULL
+         AND user_deleted_at IS NULL
+         AND is_trash = 0
+         AND start_time > ?
+       ORDER BY start_time DESC`,
+    )
+    .all(cutoffMs);
+  return rows.map(rowToRecording);
+}
+
 /** Throttled Plaud-trash rows to check for transcript/summary (does not drive pending counts). */
 export const PLAUD_TRASH_ASSET_PROBE_INTERVAL_MS = 6 * 60 * 60 * 1000;
 /** Max trash rows probed per scheduled poll (Phase 3). */
