@@ -13,6 +13,8 @@ import {
   extractMarkdownFromSummaryPayload,
 } from "../plaud/transcript.js";
 import { getFileDetail } from "../plaud/detail.js";
+import { fireRaw } from "../webhook/post.js";
+import type { WebhookPayload } from "@applaud/shared";
 import { PlaudAuthError } from "../plaud/client.js";
 import {
   upsertFromPlaud,
@@ -234,7 +236,7 @@ class Poller {
       try {
         const detail = await getFileDetail(row.id);
         const folderAbs = path.join(cfg.recordingsDir, row.folder);
-        await this.downloadContentListMarkdown(detail.content_list ?? [], folderAbs, row.id);
+        await this.downloadContentListMarkdown(detail.content_list ?? [], row, folderAbs);
       } catch (err) {
         logger.warn({ err, id: row.id }, "Phase 4 content_list download failed (non-fatal)");
       }
@@ -293,10 +295,11 @@ class Poller {
 
   private async downloadContentListMarkdown(
     contentList: { data_type: string; data_tab_name: string; data_title: string; data_id: string; data_link: string; task_status: number }[],
+    row: RecordingRow,
     folderAbs: string,
-    recordingId: string,
     forceOverwrite = false,
   ): Promise<void> {
+    const cfg = loadConfig();
     const NOTE_TYPES = new Set([
       "auto_sum_note",
       "outline",
@@ -321,17 +324,62 @@ class Poller {
       try {
         const res = await fetch(item.data_link);
         if (!res.ok) {
-          logger.warn({ id: recordingId, dataType: item.data_type, status: res.status }, "content_list item download failed");
+          logger.warn({ id: row.id, dataType: item.data_type, status: res.status }, "content_list item download failed");
           continue;
         }
         const buf = Buffer.from(await res.arrayBuffer());
         let raw: string;
         try { raw = gunzipSync(buf).toString("utf8"); } catch { raw = buf.toString("utf8"); }
         const extracted = extractMarkdownFromSummaryPayload(raw);
-        writeFileSync(destPath, extracted && extracted.trim().length > 0 ? extracted : raw, "utf8");
-        logger.info({ id: recordingId, dataType: item.data_type, fileName }, "content_list item downloaded");
+        const content = extracted && extracted.trim().length > 0 ? extracted : raw;
+        writeFileSync(destPath, content, "utf8");
+        logger.info({ id: row.id, dataType: item.data_type, fileName }, "content_list item downloaded");
+
+        // Fire webhook only for the Open Brain template summary.
+        // Other consumer_notes (Adaptive_Summary, Meeting_Summary, etc.) are saved to
+        // disk but not forwarded — the receiver would skip them anyway (no ---ENTRY--- blocks).
+        if (
+          fileName.startsWith("Open_Brain_Ready_Thought_Extractor__consumer_note") &&
+          cfg.webhook?.enabled &&
+          cfg.webhook.url
+        ) {
+          const host = cfg.bind.host === "0.0.0.0" ? "127.0.0.1" : cfg.bind.host;
+          const base = `http://${host}:${cfg.bind.port}/media/${encodeURI(row.folder)}`;
+          const payload: WebhookPayload = {
+            event: "transcript_ready",
+            recording: {
+              id: row.id,
+              filename: row.filename,
+              start_time_ms: row.startTime,
+              end_time_ms: row.endTime,
+              duration_ms: row.durationMs,
+              filesize_bytes: row.filesizeBytes,
+              serial_number: row.serialNumber,
+            },
+            files: {
+              folder: row.folder,
+              audio: `${row.folder}/audio.ogg`,
+              transcript: `${row.folder}/transcript.json`,
+              summary: `${row.folder}/${fileName}`,
+            },
+            http_urls: {
+              audio: `${base}/audio.ogg`,
+              transcript: `${base}/transcript.json`,
+              summary: `${base}/${fileName}`,
+            },
+            content: {
+              transcript_text: null,
+              summary_markdown: content,
+            },
+          };
+          const fired = await fireRaw(cfg.webhook.url, payload, row.id, "transcript_ready", cfg.webhook.secret);
+          if (fired) {
+            logger.info({ id: row.id, fileName }, "Open Brain consumer_note webhook fired");
+            emit("recording_downloaded", { recordingId: row.id });
+          }
+        }
       } catch (err) {
-        logger.warn({ err, id: recordingId, dataType: item.data_type }, "content_list item download error");
+        logger.warn({ err, id: row.id, dataType: item.data_type }, "content_list item download error");
       }
     }
   }
