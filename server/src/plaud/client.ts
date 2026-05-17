@@ -64,7 +64,13 @@ function getToken(): string {
   return cfg.token;
 }
 
-const USER_AGENT = "applaud/0.1.0 (+https://github.com/rsteckler/applaud)";
+// Plaud put their API behind Cloudflare bot protection. The original
+// self-identifying UA ("applaud/0.1.0 (+github…)") gets challenged with a
+// 403 + "Attention Required!" page before the request reaches the Plaud
+// origin. Use a real browser UA so we look like the Plaud web app.
+// Tracked upstream: https://github.com/rsteckler/applaud/issues (Cloudflare 403)
+const USER_AGENT =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
 export async function plaudFetch(pathOrUrl: string, init: FetchInit = {}): Promise<Response> {
   const url = pathOrUrl.startsWith("http") ? pathOrUrl : `${getPlaudApiBase()}${pathOrUrl}`;
